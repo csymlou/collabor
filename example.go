@@ -23,35 +23,35 @@ func Example() {
 
 	// 1. define a struct to contain data
 	type Convey struct {
-		input     any // eg. input args
-		temporary any // eg. temporary data, use to pass between jobs
-		output    any // eg. output data
+		input     interface{} // eg. input args
+		temporary interface{} // eg. temporary data, use to pass between jobs
+		output    interface{} // eg. output data
 	}
 
 	// 2. new a collabor instance
 	co := NewCo()
 
 	// 3. add jobs
-	var A = co.AddJob("A", func(ctx context.Context, i any) error {
+	var A = co.AddJob("A", func(ctx context.Context, i interface{}) error {
 		convey := i.(*Convey)
 		// do something
 		convey.output = 1
 		convey.temporary = 2
 		return nil
 	}) // A depends nothing
-	var B = co.AddJob("B", func(ctx context.Context, i any) error {
+	var B = co.AddJob("B", func(ctx context.Context, i interface{}) error {
 		convey := i.(*Convey)
 		// do something
 		convey.output = 2
 		return nil
 	}, A) // B depends on A
-	var C = co.AddJob("C", func(ctx context.Context, i any) error {
+	var C = co.AddJob("C", func(ctx context.Context, i interface{}) error {
 		convey := i.(*Convey)
 		// do something
 		convey.output = 3
 		return nil
 	}, A) // C depends on A
-	var _ = co.AddJob("D", func(ctx context.Context, i any) error {
+	var _ = co.AddJob("D", func(ctx context.Context, i interface{}) error {
 		convey := i.(*Convey)
 		// do something
 		convey.output = 4

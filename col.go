@@ -33,7 +33,7 @@ func (c *Collabor) AddJob(name string, jobFn Func, depends ...*Job) *Job {
 	return job
 }
 
-func (c *Collabor) Do(ctx context.Context, i any) error {
+func (c *Collabor) Do(ctx context.Context, i interface{}) error {
 	for _, job := range c.jobs {
 		job.sem = semaphore.NewWeighted(int64(len(job.ntfs)))
 		job.sem.Acquire(ctx, int64(len(job.ntfs)))

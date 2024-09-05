@@ -31,8 +31,8 @@ func TestCollabor(t *testing.T) {
 	type Convey struct {
 		result string
 	}
-	fake := func(name string, milli int64, args ...string) func(ctx context.Context, i any) error {
-		return func(ctx context.Context, i any) error {
+	fake := func(name string, milli int64, args ...string) func(ctx context.Context, i interface{}) error {
+		return func(ctx context.Context, i interface{}) error {
 			item := i.(*Convey)
 			time.Sleep(time.Millisecond * time.Duration(milli))
 			item.result += name

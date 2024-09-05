@@ -7,7 +7,7 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-type Func func(ctx context.Context, i any) error
+type Func func(ctx context.Context, i interface{}) error
 
 type Job struct {
 	name    string

@@ -59,12 +59,12 @@ type Convey struct {
 co := NewCo()
 
 // 3. add jobs
-var A = co.AddJob("A", func(ctx context.Context, i any) error {
+var A = co.AddJob("A", func(ctx context.Context, i interface{}) error {
     convey := i.(*Convey)
     // do something
     return nil
 }) // A depends nothing
-var B = co.AddJob("B", func(ctx context.Context, i any) error {
+var B = co.AddJob("B", func(ctx context.Context, i interface{}) error {
     convey := i.(*Convey)
     // do something
     return nil
