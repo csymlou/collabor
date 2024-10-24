@@ -22,7 +22,7 @@ func (wg *WaitGroup) Wait(timeout time.Duration) bool {
 		wg.WaitGroup.Wait()
 		return true
 	}
-	done := make(chan struct{})
+	done := make(chan struct{}, 1)
 	go func() {
 		wg.WaitGroup.Wait()
 		done <- struct{}{}

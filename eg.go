@@ -32,7 +32,7 @@ func (eg *ErrGroup) Wait(timeout time.Duration) error {
 	if timeout <= 0 {
 		return eg.Group.Wait()
 	}
-	done := make(chan struct{})
+	done := make(chan struct{}, 1)
 	var err error
 	go func() {
 		err = eg.Group.Wait()
