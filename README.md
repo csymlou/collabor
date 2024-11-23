@@ -1,3 +1,5 @@
+[中文](README.zh_CN.md)
+
 # collabor
 
 A simple and useful loading framework written in Go.
@@ -36,10 +38,10 @@ If use collabor, the time line is:
 3. 20ms: C is completed, E start
 4. 70ms: E is completed
 5. 110ms: B is completed, D start
-6. 105ms: D is completed, F start
-7. 115ms: F is completed
+6. 115ms: D is completed, F start
+7. 125ms: F is completed
 
-The total time is 115ms.
+The total time is 125ms.
 
 - **Easy-to-use**: Collabor provides a simple and easy-to-use API for managing concurrent operations.
 
@@ -48,7 +50,7 @@ You don't need to use goroutine, channel, sync or any other concurrency mechanis
 ## How to use
 
 ### Basic usage
-see [example.go](https://github.com/csymlou/collabor/blob/main/example.go)
+see [example.go](example.go)
 ```go
 // 1. define a struct to contain data
 type Convey struct {
