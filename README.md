@@ -4,6 +4,11 @@
 
 A simple and useful loading framework written in Go.
 
+Usage:
+```shell
+go get github.com/csymlou/collabor
+```
+
 ## Introduction
 **collabor** means collaborate, which can manage jobs run in order and efficiently.
 

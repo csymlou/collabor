@@ -3,6 +3,11 @@
 
 一个简单实用的并发加载框架。
 
+用法：
+```shell
+go get github.com/csymlou/collabor
+```
+
 ## 介绍
 **collabor** 字面意思是协作，它可以管理并发任务按顺序完成，效率极高。
 
