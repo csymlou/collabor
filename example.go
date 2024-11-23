@@ -11,10 +11,10 @@ func Example() {
 	* a task contains A, B, C, D 4 stages,
 	* their dependencies are as follows:
 	*     A
-	*   /	\
-	*  B	 C
-	*   \  	/
-	*	  D
+	*   /   \
+	*  B     C
+	*   \   /
+	*     D
 	*
 	* B, C can run concurrently, but depend on A,
 	* and D depend on B and C all finished.
