@@ -1,103 +1,108 @@
 [English](README.md)
+
 # collabor
 
-一个简单实用的并发加载框架。
+一个轻量的 Go DAG 并发任务执行器。任务会在其全部依赖成功后立即执行；错误、panic 或取消会阻止尚未开始的任务继续运行。
 
-用法：
 ```shell
 go get github.com/csymlou/collabor
 ```
 
-## 介绍
-**collabor** 字面意思是协作，它可以管理并发任务按顺序完成，效率极高。
+## 特性
 
-它基于有向无环图 (DAG) 实现，提供高效的并发和依赖管理，确保任务按顺序完成。
+- 按有向无环图（DAG）描述任务依赖
+- 无依赖任务并行执行，依赖满足后立即调度
+- 任务错误快速失败，并取消本次执行
+- 支持外部 context、全局超时和单任务超时
+- 捕获任务 panic，并返回 panic 值及堆栈
+- 运行前检查环、跨图依赖、nil 和重复依赖
+- 同一个构建完成的 DAG 可并发执行多次
 
+## 基础用法
 
-## 特点
-
-- **高效**: 每个任务都只依赖自己的前置任务，无其他依赖和等待，这是最高效的方式。例如：
-```flow
-        A(10ms)
-      /        \
-    B(100ms)    C(10ms)
-    |           |
-    D(5ms)      E(50ms)
-     \         /
-       F(10ms)
-```
-A(10ms) 表示任务A需要10ms完成。
-
-如何按层级执行，步骤如下：
-1. 第1层，运行A: 耗时10ms
-2. 第2层，运行B, C: 耗时100ms
-3. 第3层，运行D, E: 耗时50ms
-4. 第4层，运行F: 耗时10ms
-总耗时为10ms + 100ms + 50ms + 10ms = 170ms。
-
-如果按 collabor 方式执行，时间线如下：
-1. 0: 开始
-2. 第10ms: A完成，B, C开始
-3. 第20ms: C完成，E开始
-4. 第70ms: E完成
-5. 第110ms: B完成，D开始
-6. 第115ms: D完成，F开始
-7. 第125ms: F完成
-总耗时为125ms。
-
-- **易用**: Collabor 提供了简单且易用的 API 控制并发，你不需要使用 goroutine, channel, sync 或任何其他并发机制，collabor 会管理所有的并发。
-
-## 如何使用
-
-### 基础用法
-参考 [example.go](example.go)
 ```go
-// 1. define a struct to contain data
 type Convey struct {
-    // define the data you need
+    Input  int
+    FromB int
+    FromC int
+    Output int
 }
 
-// 2. new a collabor instance
-co := NewCo()
+co := collabor.NewCo()
 
-// 3. add jobs
-var A = co.AddJob("A", func(ctx context.Context, i interface{}) error {
-    convey := i.(*Convey)
-    // do something
+a := co.AddJob("A", func(ctx context.Context, input interface{}) error {
+    convey := input.(*Convey)
+    convey.Output = convey.Input
     return nil
-}) // A depends nothing
-var B = co.AddJob("B", func(ctx context.Context, i interface{}) error {
-    convey := i.(*Convey)
-    // do something
-    return nil
-}, A) // B depends on A
+})
 
-// 4. run jobs
-convey := &Convey{}
-err := co.Do(context.Background(), convey)
-if err != nil {
-    // handle error
-}
+b := co.AddJob("B", func(ctx context.Context, input interface{}) error {
+    input.(*Convey).FromB = 2
+    return nil
+}, a)
+
+c := co.AddJob("C", func(ctx context.Context, input interface{}) error {
+    input.(*Convey).FromC = 3
+    return nil
+}, a)
+
+co.AddJob("D", func(ctx context.Context, input interface{}) error {
+    convey := input.(*Convey)
+    convey.Output += convey.FromB + convey.FromC
+    return nil
+}, b, c)
+
+err := co.Do(context.Background(), &Convey{Input: 1})
 ```
 
-### 处理错误
+## 错误与取消
 
-情况1：如果一个任务发生错误，但是不影响其他任务（弱依赖），则该任务不需要 `return err`, 使用 `return nil` 即可，其他任务会正常运行。
+任务返回非 nil 错误后，本次执行会被取消，依赖它的任务不会启动，`Do` 返回包含任务名的包装错误。可以使用 `errors.Is` 检查原始错误。
 
-情况2：如果一个任务发生错误，且依赖该任务的任务都无法运行（如缺少必要数据/强依赖），则该任务需要 `return err`, 其他未开始的任务会被取消，`Do` 方法会返回错误。
-
-### 超时
-
-你可以设置一个整体超时时间，当超时时间到达但任务未完全完成时，剩余未开始的任务将被取消，`Do` 方法会返回错误。
-
-注意：已开始的任务不会被取消。
+任务应该监听 `ctx.Done()` 并尽快退出：
 
 ```go
-// set timeout
-var co = NewCo().WithTimeout(time.Second)
-
+co.AddJob("request", func(ctx context.Context, input interface{}) error {
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+    if err != nil {
+        return err
+    }
+    _, err = http.DefaultClient.Do(req)
+    return err
+})
 ```
 
-### 处理 Panic
+取消是协作式的：Go 无法强制终止一个忽略 context 的函数。此类函数可能在 `Do` 返回后继续运行。
 
-如果一个任务抛出 panic，该任务和其他未开始的任务会被取消，`Do` 方法会返回包含堆栈的错误。
+## 超时
+
+设置本次 DAG 执行的整体超时：
+
+```go
+co.WithTimeout(time.Second)
+```
+
+设置单个任务的超时：
+
+```go
+job := co.AddJob("slow", fn).WithTimeout(100 * time.Millisecond)
+```
+
+全局超时可通过 `errors.Is(err, collabor.ErrTimeout)` 判断；单任务超时可通过 `errors.Is(err, context.DeadlineExceeded)` 判断。
+
+## 并发安全
+
+构建完成后的 `Collabor` 可以被多个 goroutine 并发调用 `Do`，每次执行拥有独立状态。
+
+传给 `Do` 的数据由调用方管理。并行任务不能无同步地读写同一字段；请让它们写不同字段，或使用 mutex、atomic、channel 等同步机制。任务图通常应在执行前构建完成。
+
+## 图校验
+
+`Do` 会拒绝以下配置：
+
+- nil 任务函数或 nil 依赖
+- 重复依赖
+- 引用另一个 `Collabor` 中的任务
+- 循环依赖
+
+可以分别使用 `errors.Is(err, collabor.ErrInvalidGraph)` 和 `errors.Is(err, collabor.ErrCycle)` 判断。

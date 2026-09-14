@@ -2,48 +2,38 @@ package collabor
 
 import (
 	"context"
-	"errors"
 	"time"
 
-	"github.com/cloudwego/kitex/pkg/klog"
 	"golang.org/x/sync/errgroup"
 )
 
-var (
-	ErrTimeout = errors.New("collabor timeout")
-)
-
+// ErrGroup is kept for source compatibility. New code should normally use
+// Collabor directly.
 type ErrGroup struct {
 	*errgroup.Group
 }
 
-func NewErrGroup() *ErrGroup {
-	return &ErrGroup{
-		Group: &errgroup.Group{},
-	}
-}
+func NewErrGroup() *ErrGroup { return &ErrGroup{Group: &errgroup.Group{}} }
 
 func (eg *ErrGroup) WithContext(ctx context.Context) (*ErrGroup, context.Context) {
 	eg.Group, ctx = errgroup.WithContext(ctx)
 	return eg, ctx
 }
 
+// Wait waits for completion or returns ErrTimeout. It cannot cancel functions
+// added directly to ErrGroup; prefer context.WithTimeout with WithContext.
 func (eg *ErrGroup) Wait(timeout time.Duration) error {
 	if timeout <= 0 {
 		return eg.Group.Wait()
 	}
-	done := make(chan struct{}, 1)
-	var err error
-	go func() {
-		err = eg.Group.Wait()
-		done <- struct{}{}
-	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	done := make(chan error, 1)
+	go func() { done <- eg.Group.Wait() }()
 	select {
-	case <-done:
-		klog.Info("ErrGroup all finished")
+	case err := <-done:
 		return err
-	case <-time.After(timeout):
-		klog.Warn("ErrGroup timeout")
+	case <-timer.C:
 		return ErrTimeout
 	}
 }

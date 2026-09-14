@@ -2,106 +2,107 @@
 
 # collabor
 
-A simple and useful loading framework written in Go.
+A lightweight DAG task runner for Go. A job starts as soon as all of its dependencies succeed. Errors, panics, and cancellation stop jobs that have not started.
 
-Usage:
 ```shell
 go get github.com/csymlou/collabor
 ```
 
-## Introduction
-**collabor** means collaborate, which can manage jobs run in order and efficiently.
-
-This library bases on Directed Acyclic Graph (DAG). It provides an efficient and reliable way to manage concurrent operations and ensure the correct execution order.
-
-
 ## Features
 
-- **Efficiently**: Jobs run immediately after their dependencies are completed, which is the most efficient way to complete operations. For example,
-```flow
-        A(10ms)
-      /        \
-    B(100ms)    C(10ms)
-    |           |
-    D(5ms)      E(50ms)
-     \         /
-       F(10ms)
-```
-A(10ms) means that job A requires 10 milliseconds to be completed.
+- Directed acyclic graph (DAG) dependencies
+- Concurrent execution of independent jobs
+- Fail-fast error propagation and cancellation
+- Parent context, graph-level timeout, and per-job timeout support
+- Panic recovery with the panic value and stack trace
+- Validation for cycles, foreign jobs, nil dependencies, and duplicates
+- Concurrent reuse of a completed graph definition
 
-If run by level, the steps are:
-1. level 1, run A:    cost 10ms
-2. level 2, run B, C: cost 100ms
-3. level 3, run D, E: cost 50ms
-4. level 4, run F:    cost 10ms
+## Basic usage
 
-The total time is 10ms + 100ms + 50ms + 10ms = 170ms.
-
-If use collabor, the time line is:
-1. 0: start
-2. 10ms: A is completed, B and C start
-3. 20ms: C is completed, E start
-4. 70ms: E is completed
-5. 110ms: B is completed, D start
-6. 115ms: D is completed, F start
-7. 125ms: F is completed
-
-The total time is 125ms.
-
-- **Easy-to-use**: Collabor provides a simple and easy-to-use API for managing concurrent operations.
-
-You don't need to use goroutine, channel, sync or any other concurrency mechanism, collabor will manage all the concurrency for you.
-
-## How to use
-
-### Basic usage
-see [example.go](example.go)
 ```go
-// 1. define a struct to contain data
 type Convey struct {
-    // define the data you need
+    Input  int
+    FromB int
+    FromC int
+    Output int
 }
 
-// 2. new a collabor instance
-co := NewCo()
+co := collabor.NewCo()
 
-// 3. add jobs
-var A = co.AddJob("A", func(ctx context.Context, i interface{}) error {
-    convey := i.(*Convey)
-    // do something
+a := co.AddJob("A", func(ctx context.Context, input interface{}) error {
+    convey := input.(*Convey)
+    convey.Output = convey.Input
     return nil
-}) // A depends nothing
-var B = co.AddJob("B", func(ctx context.Context, i interface{}) error {
-    convey := i.(*Convey)
-    // do something
-    return nil
-}, A) // B depends on A
+})
 
-// 4. run jobs
-convey := &Convey{}
-err := co.Do(context.Background(), convey)
-if err != nil {
-    // handle error
-}
+b := co.AddJob("B", func(ctx context.Context, input interface{}) error {
+    input.(*Convey).FromB = 2
+    return nil
+}, a)
+
+c := co.AddJob("C", func(ctx context.Context, input interface{}) error {
+    input.(*Convey).FromC = 3
+    return nil
+}, a)
+
+co.AddJob("D", func(ctx context.Context, input interface{}) error {
+    convey := input.(*Convey)
+    convey.Output += convey.FromB + convey.FromC
+    return nil
+}, b, c)
+
+err := co.Do(context.Background(), &Convey{Input: 1})
 ```
 
-### Error
-Case 1: If an error occurs in one job, but does not affect others, then the job doesn't need `return err`, use `return nil` instead, and other jobs will run as normal. 
+## Errors and cancellation
 
-Case 2: If an error occurs in one job, and the dependent jobs can not run (missing necessary data), then the job needs `return err`, and other jobs will be canceled, an error will be returned by the `Do` method.
+When a job returns a non-nil error, the execution is cancelled, dependent jobs do not start, and `Do` returns an error wrapping the original error. Use `errors.Is` to inspect it.
 
-### Timeout
-
-You can set a timeout for all jobs. When the timeout arrives but the jobs are not completely finished, the remaining jobs which have not started will be cancelled. 
-
-Note: The started jobs will not be canceled.
+Jobs should observe `ctx.Done()` and stop promptly:
 
 ```go
-// set timeout
-var co = NewCo().WithTimeout(time.Second)
-
+co.AddJob("request", func(ctx context.Context, input interface{}) error {
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+    if err != nil {
+        return err
+    }
+    _, err = http.DefaultClient.Do(req)
+    return err
+})
 ```
 
-### Panic
+Cancellation is cooperative: Go cannot forcibly stop a function that ignores its context. Such a function may continue after `Do` returns.
 
-If a job throws panic, the job and other jobs will be canceled, and an error containing stack information will be returned. 
+## Timeouts
+
+Set a timeout for the entire execution:
+
+```go
+co.WithTimeout(time.Second)
+```
+
+Set a timeout for one job:
+
+```go
+job := co.AddJob("slow", fn).WithTimeout(100 * time.Millisecond)
+```
+
+A graph timeout matches `collabor.ErrTimeout` with `errors.Is`. A per-job timeout matches `context.DeadlineExceeded`.
+
+## Concurrency safety
+
+A fully configured `Collabor` can be reused by concurrent calls to `Do`; each execution has independent runtime state.
+
+The caller owns the value passed to `Do`. Concurrent jobs must not access the same mutable fields without synchronization. Give jobs separate output fields, or use mutexes, atomics, or channels. Graphs should normally be configured before execution starts.
+
+## Graph validation
+
+`Do` rejects:
+
+- nil job functions or dependencies
+- duplicate dependencies
+- dependencies from another `Collabor`
+- dependency cycles
+
+Use `errors.Is` with `collabor.ErrInvalidGraph` or `collabor.ErrCycle` to identify these errors.

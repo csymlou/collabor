@@ -2,232 +2,200 @@ package collabor
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
 )
 
-func TestCollabor(t *testing.T) {
-	in := func(s string, ss []string) bool {
-		for _, s1 := range ss {
-			if s == s1 {
-				return true
+func TestCollaborOrderAndConcurrency(t *testing.T) {
+	co := NewCo()
+	var mu sync.Mutex
+	finished := make([]string, 0, 4)
+	record := func(name string, delay time.Duration) Func {
+		return func(ctx context.Context, _ interface{}) error {
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return ctx.Err()
 			}
-		}
-		return false
-	}
-	approximately := func(a, b time.Duration) bool {
-		delta := time.Duration(float64(b) * 0.05)
-		return a >= b-delta && a <= b+delta
-	}
-	timeit := func(f func()) time.Duration {
-		begin := time.Now()
-		f()
-		return time.Since(begin)
-	}
-
-	type Convey struct {
-		result string
-	}
-	fake := func(name string, milli int64, args ...string) func(ctx context.Context, i interface{}) error {
-		return func(ctx context.Context, i interface{}) error {
-			item := i.(*Convey)
-			time.Sleep(time.Millisecond * time.Duration(milli))
-			item.result += name
-			if in("err", args) {
-				return fmt.Errorf("job %s error", name)
-			}
-			if in("panic", args) {
-				panic(fmt.Sprintf("job %s panic", name))
-			}
+			mu.Lock()
+			finished = append(finished, name)
+			mu.Unlock()
 			return nil
 		}
 	}
 
-	t.Run("single", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		co.AddJob("A", fake("A", 100))
-		it := timeit(func() {
-			co.Do(context.Background(), convey)
-		})
-		assert.Equal(t, "A", convey.result)
-		assert.True(t, approximately(it, time.Millisecond*100))
+	a := co.AddJob("A", record("A", 10*time.Millisecond))
+	b := co.AddJob("B", record("B", 30*time.Millisecond), a)
+	c := co.AddJob("C", record("C", 10*time.Millisecond), a)
+	co.AddJob("D", record("D", 0), b, c)
+
+	start := time.Now()
+	if err := co.Do(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if elapsed >= 80*time.Millisecond {
+		t.Fatalf("jobs did not run concurrently: %v", elapsed)
+	}
+	mu.Lock()
+	got := fmt.Sprint(finished)
+	mu.Unlock()
+	if got != "[A C B D]" {
+		t.Fatalf("unexpected completion order: %s", got)
+	}
+}
+
+func TestCollaborErrorStopsDependentJobs(t *testing.T) {
+	want := errors.New("boom")
+	co := NewCo()
+	a := co.AddJob("A", func(context.Context, interface{}) error { return want })
+	var dependentRan atomic.Bool
+	co.AddJob("B", func(context.Context, interface{}) error {
+		dependentRan.Store(true)
+		return nil
+	}, a)
+
+	err := co.Do(context.Background(), nil)
+	if !errors.Is(err, want) {
+		t.Fatalf("got %v, want wrapped %v", err, want)
+	}
+	if dependentRan.Load() {
+		t.Fatal("dependent job ran after dependency failure")
+	}
+}
+
+func TestCollaborPanic(t *testing.T) {
+	co := NewCo()
+	co.AddJob("explode", func(context.Context, interface{}) error { panic("boom") })
+	err := co.Do(context.Background(), nil)
+	if err == nil || !contains(err.Error(), "job explode panic: boom") {
+		t.Fatalf("unexpected panic error: %v", err)
+	}
+}
+
+func TestCollaborTimeoutCancelsContext(t *testing.T) {
+	co := NewCo().WithTimeout(30 * time.Millisecond)
+	cancelled := make(chan struct{})
+	co.AddJob("wait", func(ctx context.Context, _ interface{}) error {
+		<-ctx.Done()
+		close(cancelled)
+		return ctx.Err()
 	})
 
-	t.Run("parallel", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		co.AddJob("A", fake("A", 100))
-		co.AddJob("B", fake("B", 100))
-		it := timeit(func() {
-			co.Do(context.Background(), convey)
-		})
-		assert.Contains(t, []string{"AB", "BA"}, convey.result)
-		assert.True(t, approximately(it, time.Millisecond*100))
+	err := co.Do(context.Background(), nil)
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v, want ErrTimeout", err)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("job did not observe timeout cancellation")
+	}
+}
+
+func TestJobTimeout(t *testing.T) {
+	co := NewCo()
+	co.AddJob("slow", func(ctx context.Context, _ interface{}) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}).WithTimeout(20 * time.Millisecond)
+
+	err := co.Do(context.Background(), nil)
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrTimeout) {
+		t.Fatalf("unexpected job timeout error: %v", err)
+	}
+}
+
+func TestExternalCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	co := NewCo()
+	co.AddJob("wait", func(ctx context.Context, _ interface{}) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	cancel()
+	if err := co.Do(ctx, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+}
+
+func TestGraphValidation(t *testing.T) {
+	t.Run("nil function", func(t *testing.T) {
+		co := NewCo()
+		co.AddJob("bad", nil)
+		if err := co.Do(context.Background(), nil); !errors.Is(err, ErrInvalidGraph) {
+			t.Fatalf("unexpected error: %v", err)
+		}
 	})
 
-	t.Run("serial", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		var A = co.AddJob("A", fake("A", 100))
-		_ = co.AddJob("B", fake("B", 100), A)
-		it := timeit(func() {
-			co.Do(context.Background(), convey)
-		})
-		assert.Equal(t, "AB", convey.result)
-		assert.True(t, approximately(it, time.Millisecond*200))
+	t.Run("foreign dependency", func(t *testing.T) {
+		foreign := NewCo().AddJob("foreign", func(context.Context, interface{}) error { return nil })
+		co := NewCo()
+		co.AddJob("bad", func(context.Context, interface{}) error { return nil }, foreign)
+		if err := co.Do(context.Background(), nil); !errors.Is(err, ErrInvalidGraph) {
+			t.Fatalf("unexpected error: %v", err)
+		}
 	})
 
-	t.Run("triangle", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		var A = co.AddJob("A", fake("A", 100))
-		var _ = co.AddJob("B", fake("B", 50), A)
-		var _ = co.AddJob("C", fake("C", 80), A)
-		it := timeit(func() {
-			co.Do(context.Background(), convey)
-		})
-		t.Log(convey.result, it)
-		assert.Equal(t, "ABC", convey.result)
-		assert.True(t, approximately(it, time.Millisecond*180))
+	t.Run("duplicate dependency", func(t *testing.T) {
+		co := NewCo()
+		a := co.AddJob("A", func(context.Context, interface{}) error { return nil })
+		co.AddJob("B", func(context.Context, interface{}) error { return nil }, a, a)
+		if err := co.Do(context.Background(), nil); !errors.Is(err, ErrInvalidGraph) {
+			t.Fatalf("unexpected error: %v", err)
+		}
 	})
 
-	t.Run("diamond", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		var A = co.AddJob("A", fake("A", 100))
-		var B = co.AddJob("B", fake("B", 50), A)
-		var C = co.AddJob("C", fake("C", 100), A)
-		var _ = co.AddJob("D", fake("D", 20), B, C)
-		it := timeit(func() {
-			co.Do(context.Background(), convey)
-		})
-		t.Log(convey.result, it)
-		assert.Equal(t, "ABCD", convey.result)
-		assert.True(t, approximately(it, time.Millisecond*220))
+	t.Run("cycle", func(t *testing.T) {
+		co := NewCo()
+		a := co.AddJob("A", func(context.Context, interface{}) error { return nil })
+		b := co.AddJob("B", func(context.Context, interface{}) error { return nil }, a)
+		a.deps = []*Job{b} // construct malformed graph to verify validation
+		if err := co.Do(context.Background(), nil); !errors.Is(err, ErrCycle) {
+			t.Fatalf("got %v, want ErrCycle", err)
+		}
 	})
+}
 
-	t.Run("tree", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		var A = co.AddJob("A", fake("A", 100))
-		var B = co.AddJob("B", fake("B", 50), A)
-		var C = co.AddJob("C", fake("C", 120))
-		var _ = co.AddJob("D", fake("D", 20), B, C)
-		it := timeit(func() {
-			co.Do(context.Background(), convey)
-		})
-		t.Log(convey.result, it)
-		assert.Equal(t, "ACBD", convey.result)
-		assert.True(t, approximately(it, time.Millisecond*170))
-	})
+func TestCollaborCanBeReusedConcurrently(t *testing.T) {
+	co := NewCo()
+	a := co.AddJob("A", func(context.Context, interface{}) error { return nil })
+	co.AddJob("B", func(context.Context, interface{}) error { return nil }, a)
 
-	t.Run("graph#1", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		var A = co.AddJob("A", fake("A", 5))
-		var B = co.AddJob("B", fake("B", 2))
-		var C = co.AddJob("C", fake("C", 5), A, B)
-		var D = co.AddJob("D", fake("D", 50), C)
-		var E = co.AddJob("E", fake("E", 5), C)
-		var _ = co.AddJob("F", fake("F", 1), D)
-		var _ = co.AddJob("G", fake("G", 40), E)
-		it := timeit(func() {
-			co.Do(context.Background(), convey)
-		})
-		t.Log(convey.result, it)
-		assert.Equal(t, "BACEGDF", convey.result)
-		assert.True(t, approximately(it, time.Millisecond*61))
-	})
+	const executions = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, executions)
+	for i := 0; i < executions; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- co.Do(context.Background(), nil)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
-	t.Run("graph#2", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		var A = co.AddJob("A", fake("A", 5))
-		var B = co.AddJob("B", fake("B", 2), A)
-		var C = co.AddJob("C", fake("C", 4), A)
-		var D = co.AddJob("D", fake("D", 50))
-		var E = co.AddJob("E", fake("E", 5), D)
-		var _ = co.AddJob("F", fake("F", 1), C, E)
-		var _ = co.AddJob("G", fake("G", 40), A, B, C, E)
-		it := timeit(func() {
-			co.Do(context.Background(), convey)
-		})
-		t.Log(convey.result, it)
-		assert.Equal(t, "ABCDEFG", convey.result)
-		assert.True(t, approximately(it, time.Millisecond*96))
-	})
+func TestEmptyCollabor(t *testing.T) {
+	if err := NewCo().Do(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+}
 
-	t.Run("error#1", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		var _ = co.AddJob("A", fake("A", 5, "err"))
-		timeit(func() {
-			err := co.Do(context.Background(), convey)
-			assert.EqualError(t, err, "job A error")
-		})
-	})
-
-	t.Run("error#2", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		var A = co.AddJob("A", fake("A", 5))
-		var B = co.AddJob("B", fake("B", 5, "err"), A)
-		var _ = co.AddJob("C", fake("C", 5), B)
-		timeit(func() {
-			err := co.Do(context.Background(), convey)
-			assert.EqualError(t, err, "job B error")
-		})
-	})
-
-	t.Run("timeout", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo().WithTimeout(time.Second)
-		var _ = co.AddJob("A", fake("A", 2000))
-		it := timeit(func() {
-			err := co.Do(context.Background(), convey)
-			assert.ErrorIs(t, err, ErrTimeout)
-		})
-		assert.True(t, approximately(it, time.Second))
-	})
-
-	t.Run("cancel", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		var A = co.AddJob("A", fake("A", 100))
-		var B = co.AddJob("B", fake("B", 100, "err"), A)
-		var C = co.AddJob("C", fake("C", 100), B)
-		var _ = co.AddJob("D", fake("D", 100), C)
-		it := timeit(func() {
-			err := co.Do(context.Background(), convey)
-			assert.ErrorContains(t, err, "job B error")
-		})
-		assert.True(t, approximately(it, time.Millisecond*200))
-	})
-
-	t.Run("panic#1", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		var _ = co.AddJob("A", fake("A", 5, "panic"))
-		timeit(func() {
-			err := co.Do(context.Background(), convey)
-			assert.ErrorContains(t, err, "job A panic")
-		})
-	})
-
-	t.Run("panic#2", func(t *testing.T) {
-		convey := &Convey{}
-		var co = NewCo()
-		var A = co.AddJob("A", fake("A", 5))
-		var B = co.AddJob("B", fake("B", 5, "panic"), A)
-		var _ = co.AddJob("C", fake("C", 5), B)
-		timeit(func() {
-			err := co.Do(context.Background(), convey)
-			assert.ErrorContains(t, err, "job B panic")
-		})
-	})
-
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }

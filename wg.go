@@ -3,36 +3,30 @@ package collabor
 import (
 	"sync"
 	"time"
-
-	"github.com/cloudwego/kitex/pkg/klog"
 )
 
-type WaitGroup struct {
-	*sync.WaitGroup
-}
+// WaitGroup is a sync.WaitGroup with an optional timeout wait.
+type WaitGroup struct{ *sync.WaitGroup }
 
-func NewWaitGroup() *WaitGroup {
-	return &WaitGroup{
-		WaitGroup: &sync.WaitGroup{},
-	}
-}
+func NewWaitGroup() *WaitGroup { return &WaitGroup{WaitGroup: &sync.WaitGroup{}} }
 
+// Wait returns false if timeout expires before all goroutines finish.
 func (wg *WaitGroup) Wait(timeout time.Duration) bool {
 	if timeout <= 0 {
 		wg.WaitGroup.Wait()
 		return true
 	}
-	done := make(chan struct{}, 1)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	done := make(chan struct{})
 	go func() {
 		wg.WaitGroup.Wait()
-		done <- struct{}{}
+		close(done)
 	}()
 	select {
 	case <-done:
-		klog.Info("WaitGroup all finished")
 		return true
-	case <-time.After(timeout):
-		klog.Warn("WaitGroup timeout")
+	case <-timer.C:
 		return false
 	}
 }
