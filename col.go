@@ -54,14 +54,21 @@ type jobConfig struct {
 	timeout time.Duration
 }
 
-type jobRun struct {
-	done chan struct{}
-	err  error
+type jobResult struct {
+	job *Job
+	err error
+}
+
+type activeJob struct {
+	name     string
+	deadline time.Time
+	cancel   context.CancelFunc
 }
 
 // Do executes all jobs whose dependencies complete successfully. It returns
 // the first job error, a context error, or ErrTimeout for a Collabor timeout.
 // Cancellation is cooperative: job functions should observe ctx and return.
+// Only ready jobs get a goroutine, and each started job uses one goroutine.
 func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: nil context", ErrInvalidGraph)
@@ -74,110 +81,137 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 	if err := validateGraph(configs); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(configs) == 0 {
 		return nil
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var timeoutCancel context.CancelFunc
 	if timeout > 0 {
+		var timeoutCancel context.CancelFunc
 		runCtx, timeoutCancel = context.WithTimeout(runCtx, timeout)
 		defer timeoutCancel()
 	}
 
-	runs := make(map[*Job]*jobRun, len(configs))
+	byJob := make(map[*Job]jobConfig, len(configs))
+	remaining := make(map[*Job]int, len(configs))
+	children := make(map[*Job][]*Job, len(configs))
+	ready := make([]*Job, 0, len(configs))
 	for _, cfg := range configs {
-		runs[cfg.job] = &jobRun{done: make(chan struct{})}
-	}
-
-	var wg sync.WaitGroup
-	var firstMu sync.Mutex
-	var firstErr error
-	setFirstError := func(err error) {
-		firstMu.Lock()
-		if firstErr == nil {
-			firstErr = err
-			// Record the error before cancellation so a newly-ready job cannot
-			// mistake dependency failure for successful completion.
-			cancel()
+		byJob[cfg.job] = cfg
+		remaining[cfg.job] = len(cfg.deps)
+		if len(cfg.deps) == 0 {
+			ready = append(ready, cfg.job)
 		}
-		firstMu.Unlock()
-	}
-	getFirstError := func() error {
-		firstMu.Lock()
-		defer firstMu.Unlock()
-		return firstErr
+		for _, dep := range cfg.deps {
+			children[dep] = append(children[dep], cfg.job)
+		}
 	}
 
-	for _, cfg := range configs {
-		cfg := cfg
-		state := runs[cfg.job]
-		wg.Add(1)
+	results := make(chan jobResult, len(configs))
+	active := make(map[*Job]activeJob)
+	defer func() {
+		for _, execution := range active {
+			execution.cancel()
+		}
+	}()
+
+	start := func(job *Job) {
+		cfg := byJob[job]
+		jobCtx := runCtx
+		jobCancel := func() {}
+		var deadline time.Time
+		if cfg.timeout > 0 {
+			jobCtx, jobCancel = context.WithTimeout(runCtx, cfg.timeout)
+			deadline, _ = jobCtx.Deadline()
+		}
+		active[job] = activeJob{name: cfg.name, deadline: deadline, cancel: jobCancel}
 		go func() {
-			defer wg.Done()
-			defer close(state.done)
-
-			for _, dep := range cfg.deps {
-				depState := runs[dep]
-				select {
-				case <-depState.done:
-					if depState.err != nil {
-						state.err = fmt.Errorf("job %s skipped: dependency %s failed", cfg.name, dep.name)
-						return
-					}
-				case <-runCtx.Done():
-					state.err = runCtx.Err()
-					return
-				}
-			}
-
-			// Synchronize with error publication immediately before starting.
-			firstMu.Lock()
-			if firstErr != nil || runCtx.Err() != nil {
-				state.err = runCtx.Err()
-				firstMu.Unlock()
-				return
-			}
-			firstMu.Unlock()
-
-			state.err = executeJob(runCtx, cfg, input)
-			if state.err != nil && runCtx.Err() == nil {
-				setFirstError(state.err)
-			}
+			results <- jobResult{job: job, err: runJob(jobCtx, cfg, input)}
 		}()
 	}
 
-	allDone := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(allDone)
-	}()
+	completed := 0
+	for completed < len(configs) {
+		for len(ready) > 0 {
+			job := ready[0]
+			ready = ready[1:]
+			start(job)
+		}
 
-	select {
-	case <-allDone:
-		if err := getFirstError(); err != nil {
-			return err
+		timer, timerC := nextJobTimer(active)
+		select {
+		case result := <-results:
+			if timer != nil {
+				timer.Stop()
+			}
+			execution := active[result.job]
+			execution.cancel()
+			delete(active, result.job)
+			completed++
+
+			// Prefer a parent/global cancellation if it raced with completion.
+			if err := executionError(ctx, runCtx, timeout); err != nil {
+				return err
+			}
+			if result.err != nil {
+				return result.err
+			}
+			for _, child := range children[result.job] {
+				remaining[child]--
+				if remaining[child] == 0 {
+					ready = append(ready, child)
+				}
+			}
+		case <-runCtx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			return executionError(ctx, runCtx, timeout)
+		case now := <-timerC:
+			for _, execution := range active {
+				if !execution.deadline.IsZero() && !execution.deadline.After(now) {
+					execution.cancel()
+					return fmt.Errorf("job %s: %w", execution.name, context.DeadlineExceeded)
+				}
+			}
 		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if timeout > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("%w: %v", ErrTimeout, runCtx.Err())
-		}
-		return nil
-	case <-runCtx.Done():
-		if err := getFirstError(); err != nil {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if timeout > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("%w: %v", ErrTimeout, runCtx.Err())
-		}
-		return runCtx.Err()
 	}
+	return nil
+}
+
+func executionError(parent, runCtx context.Context, timeout time.Duration) error {
+	if err := parent.Err(); err != nil {
+		return err
+	}
+	if timeout > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %v", ErrTimeout, runCtx.Err())
+	}
+	return runCtx.Err()
+}
+
+func nextJobTimer(active map[*Job]activeJob) (*time.Timer, <-chan time.Time) {
+	var nearest time.Time
+	for _, execution := range active {
+		if execution.deadline.IsZero() {
+			continue
+		}
+		if nearest.IsZero() || execution.deadline.Before(nearest) {
+			nearest = execution.deadline
+		}
+	}
+	if nearest.IsZero() {
+		return nil, nil
+	}
+	delay := time.Until(nearest)
+	if delay < 0 {
+		delay = 0
+	}
+	timer := time.NewTimer(delay)
+	return timer, timer.C
 }
 
 func (c *Collabor) snapshot() ([]jobConfig, time.Duration, error) {
@@ -252,36 +286,17 @@ func validateGraph(configs []jobConfig) error {
 	return nil
 }
 
-func executeJob(ctx context.Context, cfg jobConfig, input interface{}) error {
-	jobCtx := ctx
-	cancel := func() {}
-	if cfg.timeout > 0 {
-		jobCtx, cancel = context.WithTimeout(ctx, cfg.timeout)
-	}
-	defer cancel()
-
-	result := make(chan error, 1)
-	go func() {
-		var err error
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				err = fmt.Errorf("job %s panic: %v\n%s", cfg.name, recovered, debug.Stack())
-			}
-			result <- err
-		}()
-		err = cfg.fn(jobCtx, input)
+func runJob(ctx context.Context, cfg jobConfig, input interface{}) (err error) {
+	completed := false
+	defer func() {
+		if !completed {
+			recovered := recover()
+			err = fmt.Errorf("job %s panic: %v\n%s", cfg.name, recovered, debug.Stack())
+		} else if err != nil {
+			err = fmt.Errorf("job %s: %w", cfg.name, err)
+		}
 	}()
-
-	select {
-	case err := <-result:
-		if err != nil {
-			return fmt.Errorf("job %s: %w", cfg.name, err)
-		}
-		return nil
-	case <-jobCtx.Done():
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("job %s: %w", cfg.name, jobCtx.Err())
-	}
+	err = cfg.fn(ctx, input)
+	completed = true
+	return err
 }

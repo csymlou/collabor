@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -159,6 +160,37 @@ func TestGraphValidation(t *testing.T) {
 			t.Fatalf("got %v, want ErrCycle", err)
 		}
 	})
+}
+
+func TestOnlyReadyJobsStartGoroutines(t *testing.T) {
+	co := NewCo()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	previous := co.AddJob("0", func(context.Context, interface{}) error {
+		close(started)
+		<-release
+		return nil
+	})
+	for i := 1; i < 1000; i++ {
+		previous = co.AddJob(fmt.Sprint(i), func(context.Context, interface{}) error { return nil }, previous)
+	}
+
+	baseline := runtime.NumGoroutine()
+	done := make(chan error, 1)
+	go func() { done <- co.Do(context.Background(), nil) }()
+	<-started
+	// Allow the scheduler to settle. A scheduler that starts one waiting
+	// goroutine per node would add roughly 1000 goroutines here.
+	time.Sleep(20 * time.Millisecond)
+	if added := runtime.NumGoroutine() - baseline; added > 20 {
+		close(release)
+		<-done
+		t.Fatalf("blocked graph created too many goroutines: %d", added)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCollaborCanBeReusedConcurrently(t *testing.T) {
