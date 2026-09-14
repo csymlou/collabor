@@ -72,7 +72,7 @@ co.AddJob("request", func(ctx context.Context, input interface{}) error {
 })
 ```
 
-取消是协作式的：Go 无法强制终止一个忽略 context 的函数。此类函数可能在 `Do` 返回后继续运行。
+取消是协作式的：Go 无法强制终止一个忽略 context 的函数。此类函数可能在 `Do` 返回后继续运行，并继续访问传入的 `input` 及其引用的资源。调用方必须确保这些数据在任务实际退出前仍然有效，且不能在无同步的情况下复用或修改。
 
 ## 超时
 
@@ -88,7 +88,7 @@ co.WithTimeout(time.Second)
 job := co.AddJob("slow", fn).WithTimeout(100 * time.Millisecond)
 ```
 
-全局超时可通过 `errors.Is(err, collabor.ErrTimeout)` 判断；单任务超时可通过 `errors.Is(err, context.DeadlineExceeded)` 判断。
+全局超时可通过 `errors.Is(err, collabor.ErrTimeout)` 判断；单任务超时可通过 `errors.Is(err, context.DeadlineExceeded)` 判断。多个终止条件同时发生时，调用方 context 优先于全局超时，全局超时优先于单任务超时。单任务函数在 deadline 前返回时采用其结果，在 deadline 时或之后返回时采用超时结果。
 
 ## 并发安全
 

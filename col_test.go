@@ -1,6 +1,7 @@
 package collabor
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -108,6 +109,57 @@ func TestJobTimeout(t *testing.T) {
 	err := co.Do(context.Background(), nil)
 	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrTimeout) {
 		t.Fatalf("unexpected job timeout error: %v", err)
+	}
+}
+
+func TestJobResultBeforeDeadlineWins(t *testing.T) {
+	co := NewCo()
+	co.AddJob("quick", func(context.Context, interface{}) error {
+		time.Sleep(5 * time.Millisecond)
+		return nil
+	}).WithTimeout(100 * time.Millisecond)
+	if err := co.Do(context.Background(), nil); err != nil {
+		t.Fatalf("result before deadline was rejected: %v", err)
+	}
+}
+
+func TestJobResultAfterDeadlineIsTimeout(t *testing.T) {
+	businessErr := errors.New("late business error")
+	co := NewCo()
+	co.AddJob("late", func(context.Context, interface{}) error {
+		time.Sleep(30 * time.Millisecond) // intentionally ignores cancellation
+		return businessErr
+	}).WithTimeout(10 * time.Millisecond)
+	if err := co.Do(context.Background(), nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want deadline exceeded", err)
+	}
+}
+
+func TestDeadlineHeapUsesStableJobOrder(t *testing.T) {
+	deadline := time.Now().Add(time.Second)
+	h := deadlineHeap{
+		&deadlineEntry{deadline: deadline, order: 2},
+		&deadlineEntry{deadline: deadline, order: 0},
+		&deadlineEntry{deadline: deadline, order: 1},
+	}
+	heap.Init(&h)
+	for want := 0; want < 3; want++ {
+		if got := heap.Pop(&h).(*deadlineEntry).order; got != want {
+			t.Fatalf("got order %d, want %d", got, want)
+		}
+	}
+}
+
+func TestRunJobRecordsCompletion(t *testing.T) {
+	cfg := jobConfig{name: "quick", fn: func(context.Context, interface{}) error { return nil }}
+	started := time.Now()
+	err, finishedAt := runJob(context.Background(), cfg, nil)
+	observedAt := time.Now()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finishedAt.Before(started) || finishedAt.After(observedAt) {
+		t.Fatalf("completion timestamp %v is outside [%v, %v]", finishedAt, started, observedAt)
 	}
 }
 

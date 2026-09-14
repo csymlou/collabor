@@ -72,7 +72,7 @@ co.AddJob("request", func(ctx context.Context, input interface{}) error {
 })
 ```
 
-Cancellation is cooperative: Go cannot forcibly stop a function that ignores its context. Such a function may continue after `Do` returns.
+Cancellation is cooperative: Go cannot forcibly stop a function that ignores its context. Such a function may continue after `Do` returns and keep accessing the supplied `input` and referenced resources. Callers must keep that data valid and must not reuse or mutate it without synchronization until the job actually exits.
 
 ## Timeouts
 
@@ -88,7 +88,7 @@ Set a timeout for one job:
 job := co.AddJob("slow", fn).WithTimeout(100 * time.Millisecond)
 ```
 
-A graph timeout matches `collabor.ErrTimeout` with `errors.Is`. A per-job timeout matches `context.DeadlineExceeded`.
+A graph timeout matches `collabor.ErrTimeout` with `errors.Is`. A per-job timeout matches `context.DeadlineExceeded`. If termination conditions happen together, caller context cancellation takes precedence over the graph timeout, which takes precedence over per-job timeouts. A job result is used when the function returns before its deadline; a return at or after the deadline is treated as a timeout.
 
 ## Concurrency safety
 

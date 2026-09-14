@@ -1,6 +1,7 @@
 package collabor
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -52,17 +53,56 @@ type jobConfig struct {
 	fn      Func
 	deps    []*Job
 	timeout time.Duration
+	order   int
 }
 
 type jobResult struct {
-	job *Job
-	err error
+	job        *Job
+	err        error
+	finishedAt time.Time
 }
 
 type activeJob struct {
 	name     string
 	deadline time.Time
 	cancel   context.CancelFunc
+	entry    *deadlineEntry
+}
+
+type deadlineEntry struct {
+	job      *Job
+	deadline time.Time
+	order    int
+	index    int
+}
+
+type deadlineHeap []*deadlineEntry
+
+func (h deadlineHeap) Len() int { return len(h) }
+func (h deadlineHeap) Less(i, j int) bool {
+	if h[i].deadline.Equal(h[j].deadline) {
+		return h[i].order < h[j].order
+	}
+	return h[i].deadline.Before(h[j].deadline)
+}
+func (h deadlineHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+func (h *deadlineHeap) Push(value interface{}) {
+	entry := value.(*deadlineEntry)
+	entry.index = len(*h)
+	*h = append(*h, entry)
+}
+func (h *deadlineHeap) Pop() interface{} {
+	old := *h
+	last := len(old) - 1
+	entry := old[last]
+	old[last] = nil
+	entry.index = -1
+	*h = old[:last]
+	return entry
 }
 
 // Do executes all jobs whose dependencies complete successfully. It returns
@@ -113,6 +153,8 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 
 	results := make(chan jobResult, len(configs))
 	active := make(map[*Job]activeJob)
+	deadlines := make(deadlineHeap, 0, len(configs))
+	heap.Init(&deadlines)
 	defer func() {
 		for _, execution := range active {
 			execution.cancel()
@@ -124,59 +166,104 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 		jobCtx := runCtx
 		jobCancel := func() {}
 		var deadline time.Time
+		var entry *deadlineEntry
 		if cfg.timeout > 0 {
 			jobCtx, jobCancel = context.WithTimeout(runCtx, cfg.timeout)
 			deadline, _ = jobCtx.Deadline()
+			entry = &deadlineEntry{job: job, deadline: deadline, order: cfg.order}
+			heap.Push(&deadlines, entry)
 		}
-		active[job] = activeJob{name: cfg.name, deadline: deadline, cancel: jobCancel}
+		active[job] = activeJob{name: cfg.name, deadline: deadline, cancel: jobCancel, entry: entry}
 		go func() {
-			results <- jobResult{job: job, err: runJob(jobCtx, cfg, input)}
+			err, finishedAt := runJob(jobCtx, cfg, input)
+			results <- jobResult{job: job, err: err, finishedAt: finishedAt}
 		}()
 	}
 
 	completed := 0
+	handleResult := func(result jobResult) error {
+		execution, ok := active[result.job]
+		if !ok {
+			return fmt.Errorf("%w: result from inactive job", ErrInvalidGraph)
+		}
+		execution.cancel()
+		if execution.entry != nil && execution.entry.index >= 0 {
+			heap.Remove(&deadlines, execution.entry.index)
+		}
+		delete(active, result.job)
+		completed++
+
+		// Caller cancellation wins over the graph timeout, which wins over a
+		// per-job timeout. A job result is accepted only if the function
+		// returned before its own deadline.
+		if err := executionError(ctx, runCtx, timeout); err != nil {
+			return err
+		}
+		if !execution.deadline.IsZero() && !result.finishedAt.Before(execution.deadline) {
+			return fmt.Errorf("job %s: %w", execution.name, context.DeadlineExceeded)
+		}
+		if result.err != nil {
+			return result.err
+		}
+		for _, child := range children[result.job] {
+			remaining[child]--
+			if remaining[child] == 0 {
+				ready = append(ready, child)
+			}
+		}
+		return nil
+	}
+
+	deadlineTimer := time.NewTimer(time.Hour)
+	if !deadlineTimer.Stop() {
+		<-deadlineTimer.C
+	}
+	defer deadlineTimer.Stop()
+
 	for completed < len(configs) {
 		for len(ready) > 0 {
 			job := ready[0]
 			ready = ready[1:]
 			start(job)
 		}
+		if len(active) == 0 {
+			return fmt.Errorf("%w: unfinished jobs but no runnable jobs", ErrInvalidGraph)
+		}
 
-		timer, timerC := nextJobTimer(active)
+		timerC := resetDeadlineTimer(deadlineTimer, deadlines)
 		select {
 		case result := <-results:
-			if timer != nil {
-				timer.Stop()
+			stopTimer(deadlineTimer)
+			if err := handleResult(result); err != nil {
+				return err
 			}
-			execution := active[result.job]
-			execution.cancel()
-			delete(active, result.job)
-			completed++
-
-			// Prefer a parent/global cancellation if it raced with completion.
+		case <-runCtx.Done():
+			stopTimer(deadlineTimer)
+			return executionError(ctx, runCtx, timeout)
+		case <-timerC:
+			// Prefer results that were already published when the timer fired.
+			// Their completion timestamp decides whether they beat the deadline.
+			draining := true
+			for draining {
+				select {
+				case result := <-results:
+					if err := handleResult(result); err != nil {
+						return err
+					}
+				default:
+					draining = false
+				}
+			}
+			if completed == len(configs) {
+				return nil
+			}
 			if err := executionError(ctx, runCtx, timeout); err != nil {
 				return err
 			}
-			if result.err != nil {
-				return result.err
-			}
-			for _, child := range children[result.job] {
-				remaining[child]--
-				if remaining[child] == 0 {
-					ready = append(ready, child)
-				}
-			}
-		case <-runCtx.Done():
-			if timer != nil {
-				timer.Stop()
-			}
-			return executionError(ctx, runCtx, timeout)
-		case now := <-timerC:
-			for _, execution := range active {
-				if !execution.deadline.IsZero() && !execution.deadline.After(now) {
-					execution.cancel()
-					return fmt.Errorf("job %s: %w", execution.name, context.DeadlineExceeded)
-				}
+			if len(deadlines) > 0 && !deadlines[0].deadline.After(time.Now()) {
+				execution := active[deadlines[0].job]
+				execution.cancel()
+				return fmt.Errorf("job %s: %w", execution.name, context.DeadlineExceeded)
 			}
 		}
 	}
@@ -193,25 +280,26 @@ func executionError(parent, runCtx context.Context, timeout time.Duration) error
 	return runCtx.Err()
 }
 
-func nextJobTimer(active map[*Job]activeJob) (*time.Timer, <-chan time.Time) {
-	var nearest time.Time
-	for _, execution := range active {
-		if execution.deadline.IsZero() {
-			continue
-		}
-		if nearest.IsZero() || execution.deadline.Before(nearest) {
-			nearest = execution.deadline
-		}
+func resetDeadlineTimer(timer *time.Timer, deadlines deadlineHeap) <-chan time.Time {
+	stopTimer(timer)
+	if len(deadlines) == 0 {
+		return nil
 	}
-	if nearest.IsZero() {
-		return nil, nil
-	}
-	delay := time.Until(nearest)
+	delay := time.Until(deadlines[0].deadline)
 	if delay < 0 {
 		delay = 0
 	}
-	timer := time.NewTimer(delay)
-	return timer, timer.C
+	timer.Reset(delay)
+	return timer.C
+}
+
+func stopTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
 }
 
 func (c *Collabor) snapshot() ([]jobConfig, time.Duration, error) {
@@ -219,7 +307,7 @@ func (c *Collabor) snapshot() ([]jobConfig, time.Duration, error) {
 	defer c.mu.RUnlock()
 
 	configs := make([]jobConfig, 0, len(c.jobs))
-	for _, job := range c.jobs {
+	for order, job := range c.jobs {
 		if job == nil {
 			return nil, 0, fmt.Errorf("%w: nil job", ErrInvalidGraph)
 		}
@@ -227,6 +315,7 @@ func (c *Collabor) snapshot() ([]jobConfig, time.Duration, error) {
 		configs = append(configs, jobConfig{
 			job: job, name: job.name, fn: job.fn,
 			deps: append([]*Job(nil), job.deps...), timeout: job.timeout,
+			order: order,
 		})
 		job.mu.RUnlock()
 	}
@@ -286,10 +375,11 @@ func validateGraph(configs []jobConfig) error {
 	return nil
 }
 
-func runJob(ctx context.Context, cfg jobConfig, input interface{}) (err error) {
+func runJob(ctx context.Context, cfg jobConfig, input interface{}) (err error, finishedAt time.Time) {
 	completed := false
 	defer func() {
 		if !completed {
+			finishedAt = time.Now()
 			recovered := recover()
 			err = fmt.Errorf("job %s panic: %v\n%s", cfg.name, recovered, debug.Stack())
 		} else if err != nil {
@@ -297,6 +387,8 @@ func runJob(ctx context.Context, cfg jobConfig, input interface{}) (err error) {
 		}
 	}()
 	err = cfg.fn(ctx, input)
+	// Record completion before framework-side error wrapping and result delivery.
+	finishedAt = time.Now()
 	completed = true
-	return err
+	return err, finishedAt
 }
