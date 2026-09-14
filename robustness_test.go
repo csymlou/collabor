@@ -131,6 +131,43 @@ func TestConcurrentJobTimeoutUpdatesAreRaceFree(t *testing.T) {
 	wg.Wait()
 }
 
+func TestPerJobDeadlineInterruptsReadyDispatch(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+
+	const roots = 30000
+	var entered atomicInt32
+	releaseTimed := make(chan struct{})
+
+	co := NewCo()
+	co.AddJob("timed", func(ctx context.Context, _ interface{}) error {
+		<-releaseTimed // intentionally ignore cancellation until the test releases it
+		return ctx.Err()
+	}).WithTimeout(time.Nanosecond)
+	for i := 0; i < roots; i++ {
+		co.AddJob(fmt.Sprint(i), func(context.Context, interface{}) error {
+			entered.Add(1)
+			return nil
+		})
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- co.Do(context.Background(), nil) }()
+	select {
+	case err := <-done:
+		close(releaseTimed)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("got %v, want context deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseTimed)
+		t.Fatal("per-job deadline did not interrupt ready dispatch")
+	}
+	if got := entered.Load(); got != 0 {
+		t.Fatalf("%d ready jobs entered after an already-expired per-job deadline", got)
+	}
+}
+
 func TestManyConcurrentFailuresReturnPromptly(t *testing.T) {
 	co := NewCo()
 	const jobs = 500

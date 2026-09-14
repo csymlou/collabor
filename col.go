@@ -250,6 +250,31 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 		return nil
 	}
 
+	// handleExpiredDeadline is shared by ready dispatch and the timer path so
+	// an expired per-job deadline is observed even while a large ready queue is
+	// being drained. handled is true when an expired deadline was processed.
+	handleExpiredDeadline := func(now time.Time) (handled bool, err error) {
+		if len(deadlines) == 0 || deadlines[0].deadline.After(now) {
+			return false, nil
+		}
+		execution := active[deadlines[0].job]
+		if execution == nil {
+			return true, fmt.Errorf("%w: deadline for inactive job", ErrInvalidGraph)
+		}
+
+		// The function may have completed before the deadline while its
+		// notification is waiting to be selected. done publishes the raw result
+		// and establishes the happens-before edge needed to read it safely.
+		select {
+		case <-execution.done:
+			return true, handleResult(execution)
+		default:
+		}
+
+		execution.cancel()
+		return true, &jobError{name: execution.name, err: context.DeadlineExceeded}
+	}
+
 	deadlineTimer := time.NewTimer(time.Hour)
 	if !deadlineTimer.Stop() {
 		<-deadlineTimer.C
@@ -270,6 +295,11 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 				}
 				continue
 			default:
+			}
+			if handled, err := handleExpiredDeadline(time.Now()); err != nil {
+				return err
+			} else if handled {
+				continue
 			}
 			if err := runCtx.Err(); err != nil {
 				return executionError(ctx, runCtx, timeout)
@@ -312,21 +342,10 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 			if err := executionError(ctx, runCtx, timeout); err != nil {
 				return err
 			}
-			if len(deadlines) > 0 && !deadlines[0].deadline.After(time.Now()) {
-				execution := active[deadlines[0].job]
-				// The function may have completed before the deadline while its
-				// notification was waiting to be selected. done publishes the raw
-				// result without requiring error formatting first.
-				select {
-				case <-execution.done:
-					if err := handleResult(execution); err != nil {
-						return err
-					}
-					continue
-				default:
-				}
-				execution.cancel()
-				return &jobError{name: execution.name, err: context.DeadlineExceeded}
+			if handled, err := handleExpiredDeadline(time.Now()); err != nil {
+				return err
+			} else if handled {
+				continue
 			}
 		}
 	}
