@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -16,32 +15,61 @@ func TestCollaborOrderAndConcurrency(t *testing.T) {
 	co := NewCo()
 	var mu sync.Mutex
 	finished := make([]string, 0, 4)
-	record := func(name string, delay time.Duration) Func {
-		return func(ctx context.Context, _ interface{}) error {
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			mu.Lock()
-			finished = append(finished, name)
-			mu.Unlock()
-			return nil
+	record := func(name string) {
+		mu.Lock()
+		finished = append(finished, name)
+		mu.Unlock()
+	}
+
+	bothStarted := make(chan struct{})
+	releaseB := make(chan struct{})
+	releaseC := make(chan struct{})
+	var branchStarts atomicInt32
+	a := co.AddJob("A", func(context.Context, interface{}) error {
+		record("A")
+		return nil
+	})
+	b := co.AddJob("B", func(context.Context, interface{}) error {
+		if branchStarts.Add(1) == 2 {
+			close(bothStarted)
 		}
+		<-releaseB
+		record("B")
+		return nil
+	}, a)
+	c := co.AddJob("C", func(context.Context, interface{}) error {
+		if branchStarts.Add(1) == 2 {
+			close(bothStarted)
+		}
+		<-releaseC
+		record("C")
+		return nil
+	}, a)
+	co.AddJob("D", func(context.Context, interface{}) error {
+		record("D")
+		return nil
+	}, b, c)
+
+	done := make(chan error, 1)
+	go func() { done <- co.Do(context.Background(), nil) }()
+	select {
+	case <-bothStarted:
+	case <-time.After(time.Second):
+		t.Fatal("independent branches did not start concurrently")
 	}
-
-	a := co.AddJob("A", record("A", 10*time.Millisecond))
-	b := co.AddJob("B", record("B", 30*time.Millisecond), a)
-	c := co.AddJob("C", record("C", 10*time.Millisecond), a)
-	co.AddJob("D", record("D", 0), b, c)
-
-	start := time.Now()
-	if err := co.Do(context.Background(), nil); err != nil {
+	close(releaseC)
+	for {
+		mu.Lock()
+		cFinished := len(finished) == 2
+		mu.Unlock()
+		if cFinished {
+			break
+		}
+		runtime.Gosched()
+	}
+	close(releaseB)
+	if err := <-done; err != nil {
 		t.Fatal(err)
-	}
-	elapsed := time.Since(start)
-	if elapsed >= 80*time.Millisecond {
-		t.Fatalf("jobs did not run concurrently: %v", elapsed)
 	}
 	mu.Lock()
 	got := fmt.Sprint(finished)
@@ -55,7 +83,7 @@ func TestCollaborErrorStopsDependentJobs(t *testing.T) {
 	want := errors.New("boom")
 	co := NewCo()
 	a := co.AddJob("A", func(context.Context, interface{}) error { return want })
-	var dependentRan atomic.Bool
+	var dependentRan atomicBool
 	co.AddJob("B", func(context.Context, interface{}) error {
 		dependentRan.Store(true)
 		return nil
@@ -150,17 +178,91 @@ func TestDeadlineHeapUsesStableJobOrder(t *testing.T) {
 	}
 }
 
-func TestRunJobRecordsCompletion(t *testing.T) {
+func TestExecuteJobRecordsCompletion(t *testing.T) {
 	cfg := jobConfig{name: "quick", fn: func(context.Context, interface{}) error { return nil }}
+	execution := &activeJob{done: make(chan struct{})}
+	results := make(chan *activeJob, 1)
 	started := time.Now()
-	err, finishedAt := runJob(context.Background(), cfg, nil)
+	executeJob(context.Background(), cfg, nil, execution, results)
 	observedAt := time.Now()
-	if err != nil {
-		t.Fatal(err)
+	if got := <-results; got != execution {
+		t.Fatal("unexpected execution result")
 	}
+	if execution.result.err != nil {
+		t.Fatal(execution.result.err)
+	}
+	finishedAt := execution.result.finishedAt
 	if finishedAt.Before(started) || finishedAt.After(observedAt) {
 		t.Fatalf("completion timestamp %v is outside [%v, %v]", finishedAt, started, observedAt)
 	}
+}
+
+func TestCancelledGraphDoesNotEnterReadyJobs(t *testing.T) {
+	var entered atomicInt32
+	co := NewCo().WithTimeout(time.Nanosecond)
+	for i := 0; i < 100; i++ {
+		co.AddJob(fmt.Sprint(i), func(context.Context, interface{}) error {
+			entered.Add(1)
+			return nil
+		})
+	}
+	if err := co.Do(context.Background(), nil); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v, want ErrTimeout", err)
+	}
+	if got := entered.Load(); got != 0 {
+		t.Fatalf("entered %d jobs after graph timeout", got)
+	}
+}
+
+func TestRuntimeGoexitReportsCompletion(t *testing.T) {
+	co := NewCo()
+	co.AddJob("goexit", func(context.Context, interface{}) error {
+		runtime.Goexit()
+		return nil
+	})
+	done := make(chan error, 1)
+	go func() { done <- co.Do(context.Background(), nil) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrJobTerminated) {
+			t.Fatalf("got %v, want ErrJobTerminated", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Do blocked after runtime.Goexit")
+	}
+}
+
+type blockingError struct {
+	release <-chan struct{}
+}
+
+func (e blockingError) Error() string {
+	<-e.release
+	return "business error"
+}
+
+func TestErrorFormattingDoesNotLoseCompletedResult(t *testing.T) {
+	release := make(chan struct{})
+	businessErr := blockingError{release: release}
+	co := NewCo()
+	co.AddJob("quick", func(context.Context, interface{}) error {
+		return businessErr
+	}).WithTimeout(100 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- co.Do(context.Background(), nil) }()
+	select {
+	case err := <-done:
+		// Do must return the wrapped error without invoking Error().
+		if !errors.Is(err, businessErr) {
+			close(release)
+			t.Fatal("business error was not preserved")
+		}
+	case <-time.After(50 * time.Millisecond):
+		close(release)
+		t.Fatal("error formatting blocked result publication")
+	}
+	close(release)
 }
 
 func TestExternalCancellation(t *testing.T) {

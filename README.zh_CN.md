@@ -72,7 +72,9 @@ co.AddJob("request", func(ctx context.Context, input interface{}) error {
 })
 ```
 
-取消是协作式的：Go 无法强制终止一个忽略 context 的函数。此类函数可能在 `Do` 返回后继续运行，并继续访问传入的 `input` 及其引用的资源。调用方必须确保这些数据在任务实际退出前仍然有效，且不能在无同步的情况下复用或修改。
+调度器一旦观察到取消或任务错误，就不会再派发 ready 队列中的任务；worker 在进入用户函数前也会再次检查 context。取消检查和函数调用之间仍存在不可避免的并发边界，因此取消是协作式的：Go 无法强制终止一个忽略 context 的函数。此类函数可能在 `Do` 返回后继续运行，并继续访问传入的 `input` 及其引用的资源。调用方必须确保这些数据在任务实际退出前仍然有效，且不能在无同步的情况下复用或修改。
+
+任务通过 `runtime.Goexit` 等方式退出而没有正常返回时，`Do` 返回可由 `errors.Is(err, collabor.ErrJobTerminated)` 识别的错误。
 
 ## 超时
 

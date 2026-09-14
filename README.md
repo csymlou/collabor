@@ -72,7 +72,9 @@ co.AddJob("request", func(ctx context.Context, input interface{}) error {
 })
 ```
 
-Cancellation is cooperative: Go cannot forcibly stop a function that ignores its context. Such a function may continue after `Do` returns and keep accessing the supplied `input` and referenced resources. Callers must keep that data valid and must not reuse or mutate it without synchronization until the job actually exits.
+Once the scheduler observes cancellation or a job error, it stops dispatching jobs from the ready queue; each worker also checks its context before entering user code. An unavoidable concurrency boundary remains between that check and the function call, so cancellation is cooperative: Go cannot forcibly stop a function that ignores its context. Such a function may continue after `Do` returns and keep accessing the supplied `input` and referenced resources. Callers must keep that data valid and must not reuse or mutate it without synchronization until the job actually exits.
+
+If a job exits through `runtime.Goexit` or an equivalent path without returning normally, `Do` returns an error matching `collabor.ErrJobTerminated` with `errors.Is`.
 
 ## Timeouts
 

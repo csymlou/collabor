@@ -14,7 +14,28 @@ var (
 	ErrTimeout      = errors.New("collabor timeout")
 	ErrInvalidGraph = errors.New("collabor invalid graph")
 	ErrCycle        = errors.New("collabor dependency cycle")
+	// ErrJobTerminated reports a job that exited through runtime.Goexit or an
+	// equivalent abnormal path without returning or panicking with a value.
+	ErrJobTerminated = errors.New("collabor job terminated without returning")
 )
+
+type jobError struct {
+	name string
+	err  error
+}
+
+func (e *jobError) Error() string { return "job " + e.name + ": " + e.err.Error() }
+func (e *jobError) Unwrap() error { return e.err }
+
+type jobPanicError struct {
+	name  string
+	value interface{}
+	stack []byte
+}
+
+func (e *jobPanicError) Error() string {
+	return fmt.Sprintf("job %s panic: %v\n%s", e.name, e.value, e.stack)
+}
 
 // Collabor defines a reusable directed acyclic graph of jobs.
 // A Collabor may be executed concurrently after its jobs have been added.
@@ -57,16 +78,18 @@ type jobConfig struct {
 }
 
 type jobResult struct {
-	job        *Job
 	err        error
 	finishedAt time.Time
 }
 
 type activeJob struct {
+	job      *Job
 	name     string
 	deadline time.Time
 	cancel   context.CancelFunc
 	entry    *deadlineEntry
+	done     chan struct{}
+	result   jobResult
 }
 
 type deadlineEntry struct {
@@ -151,8 +174,8 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 		}
 	}
 
-	results := make(chan jobResult, len(configs))
-	active := make(map[*Job]activeJob)
+	results := make(chan *activeJob, len(configs))
+	active := make(map[*Job]*activeJob)
 	deadlines := make(deadlineHeap, 0, len(configs))
 	heap.Init(&deadlines)
 	defer func() {
@@ -169,43 +192,56 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 		var entry *deadlineEntry
 		if cfg.timeout > 0 {
 			jobCtx, jobCancel = context.WithTimeout(runCtx, cfg.timeout)
-			deadline, _ = jobCtx.Deadline()
-			entry = &deadlineEntry{job: job, deadline: deadline, order: cfg.order}
-			heap.Push(&deadlines, entry)
+			effectiveDeadline, _ := jobCtx.Deadline()
+			parentDeadline, hasParentDeadline := runCtx.Deadline()
+			// Track only a deadline introduced by this job. If the parent
+			// deadline is earlier (or equal), cancellation must be reported as
+			// caller/global cancellation rather than a per-job timeout.
+			if !hasParentDeadline || effectiveDeadline.Before(parentDeadline) {
+				deadline = effectiveDeadline
+				entry = &deadlineEntry{job: job, deadline: deadline, order: cfg.order}
+				heap.Push(&deadlines, entry)
+			}
 		}
-		active[job] = activeJob{name: cfg.name, deadline: deadline, cancel: jobCancel, entry: entry}
-		go func() {
-			err, finishedAt := runJob(jobCtx, cfg, input)
-			results <- jobResult{job: job, err: err, finishedAt: finishedAt}
-		}()
+		execution := &activeJob{
+			job: job, name: cfg.name, deadline: deadline, cancel: jobCancel,
+			entry: entry, done: make(chan struct{}),
+		}
+		active[job] = execution
+		go executeJob(jobCtx, cfg, input, execution, results)
 	}
 
 	completed := 0
-	handleResult := func(result jobResult) error {
-		execution, ok := active[result.job]
+	handleResult := func(execution *activeJob) error {
+		current, ok := active[execution.job]
 		if !ok {
-			return fmt.Errorf("%w: result from inactive job", ErrInvalidGraph)
+			// The deadline path may process a published result before the worker's
+			// notification is selected. Ignore that later duplicate notification.
+			return nil
+		}
+		if current != execution {
+			return fmt.Errorf("%w: result from unexpected job execution", ErrInvalidGraph)
 		}
 		execution.cancel()
 		if execution.entry != nil && execution.entry.index >= 0 {
 			heap.Remove(&deadlines, execution.entry.index)
 		}
-		delete(active, result.job)
+		delete(active, execution.job)
 		completed++
 
 		// Caller cancellation wins over the graph timeout, which wins over a
-		// per-job timeout. A job result is accepted only if the function
-		// returned before its own deadline.
+		// per-job timeout. A job result is accepted only if it was published
+		// before its own deadline.
 		if err := executionError(ctx, runCtx, timeout); err != nil {
 			return err
 		}
-		if !execution.deadline.IsZero() && !result.finishedAt.Before(execution.deadline) {
-			return fmt.Errorf("job %s: %w", execution.name, context.DeadlineExceeded)
+		if !execution.deadline.IsZero() && !execution.result.finishedAt.Before(execution.deadline) {
+			return &jobError{name: execution.name, err: context.DeadlineExceeded}
 		}
-		if result.err != nil {
-			return result.err
+		if execution.result.err != nil {
+			return wrapJobError(execution.name, execution.result.err)
 		}
-		for _, child := range children[result.job] {
+		for _, child := range children[execution.job] {
 			remaining[child]--
 			if remaining[child] == 0 {
 				ready = append(ready, child)
@@ -222,6 +258,22 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 
 	for completed < len(configs) {
 		for len(ready) > 0 {
+			// Do not blindly drain a large ready queue: cancellation or a job
+			// error may already be observable and must win before more work starts.
+			if err := executionError(ctx, runCtx, timeout); err != nil {
+				return err
+			}
+			select {
+			case execution := <-results:
+				if err := handleResult(execution); err != nil {
+					return err
+				}
+				continue
+			default:
+			}
+			if err := runCtx.Err(); err != nil {
+				return executionError(ctx, runCtx, timeout)
+			}
 			job := ready[0]
 			ready = ready[1:]
 			start(job)
@@ -232,9 +284,9 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 
 		timerC := resetDeadlineTimer(deadlineTimer, deadlines)
 		select {
-		case result := <-results:
+		case execution := <-results:
 			stopTimer(deadlineTimer)
-			if err := handleResult(result); err != nil {
+			if err := handleResult(execution); err != nil {
 				return err
 			}
 		case <-runCtx.Done():
@@ -246,8 +298,8 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 			draining := true
 			for draining {
 				select {
-				case result := <-results:
-					if err := handleResult(result); err != nil {
+				case execution := <-results:
+					if err := handleResult(execution); err != nil {
 						return err
 					}
 				default:
@@ -262,8 +314,19 @@ func (c *Collabor) Do(ctx context.Context, input interface{}) error {
 			}
 			if len(deadlines) > 0 && !deadlines[0].deadline.After(time.Now()) {
 				execution := active[deadlines[0].job]
+				// The function may have completed before the deadline while its
+				// notification was waiting to be selected. done publishes the raw
+				// result without requiring error formatting first.
+				select {
+				case <-execution.done:
+					if err := handleResult(execution); err != nil {
+						return err
+					}
+					continue
+				default:
+				}
 				execution.cancel()
-				return fmt.Errorf("job %s: %w", execution.name, context.DeadlineExceeded)
+				return &jobError{name: execution.name, err: context.DeadlineExceeded}
 			}
 		}
 	}
@@ -375,20 +438,48 @@ func validateGraph(configs []jobConfig) error {
 	return nil
 }
 
-func runJob(ctx context.Context, cfg jobConfig, input interface{}) (err error, finishedAt time.Time) {
-	completed := false
+func executeJob(ctx context.Context, cfg jobConfig, input interface{}, execution *activeJob, results chan<- *activeJob) {
+	published := false
 	defer func() {
-		if !completed {
-			finishedAt = time.Now()
-			recovered := recover()
-			err = fmt.Errorf("job %s panic: %v\n%s", cfg.name, recovered, debug.Stack())
-		} else if err != nil {
-			err = fmt.Errorf("job %s: %w", cfg.name, err)
+		if !published {
+			// A non-nil recovered value is a panic. A nil value means either
+			// runtime.Goexit or panic(nil) on Go versions where they cannot be
+			// distinguished; both are reported as abnormal termination.
+			if recovered := recover(); recovered != nil {
+				execution.result.err = &jobPanicError{
+					name: cfg.name, value: recovered, stack: debug.Stack(),
+				}
+			} else {
+				execution.result.err = ErrJobTerminated
+			}
+			execution.result.finishedAt = time.Now()
+			close(execution.done)
 		}
+
+		// Keep the scheduler notification in this outermost defer so
+		// runtime.Goexit also produces exactly one completion event.
+		results <- execution
 	}()
-	err = cfg.fn(ctx, input)
-	// Record completion before framework-side error wrapping and result delivery.
-	finishedAt = time.Now()
-	completed = true
-	return err, finishedAt
+
+	// Cancellation may happen after dispatch but before this goroutine runs.
+	if err := ctx.Err(); err != nil {
+		execution.result = jobResult{err: err, finishedAt: time.Now()}
+		close(execution.done)
+		published = true
+		return
+	}
+
+	err := cfg.fn(ctx, input)
+	// Publish the raw error immediately, without formatting it. A user-defined
+	// Error method must not delay publication or alter the deadline decision.
+	execution.result = jobResult{err: err, finishedAt: time.Now()}
+	close(execution.done)
+	published = true
+}
+
+func wrapJobError(name string, err error) error {
+	if _, ok := err.(*jobPanicError); ok {
+		return err
+	}
+	return &jobError{name: name, err: err}
 }
