@@ -1,69 +1,34 @@
 package collabor
 
-import (
-	"context"
-
-	"github.com/cloudwego/kitex/pkg/klog"
-)
+import "context"
 
 func Example() {
-	/**
-	* a task contains A, B, C, D 4 stages,
-	* their dependencies are as follows:
-	*     A
-	*   /   \
-	*  B     C
-	*   \   /
-	*     D
-	*
-	* B, C can run concurrently, but depend on A,
-	* and D depend on B and C all finished.
-	*
-	**/
-
-	// 1. define a struct to contain data
 	type Convey struct {
-		input     interface{} // eg. input args
-		temporary interface{} // eg. temporary data, use to pass between jobs
-		output    interface{} // eg. output data
+		input  int
+		fromB  int // parallel jobs write separate fields
+		fromC  int
+		output int
 	}
 
-	// 2. new a collabor instance
 	co := NewCo()
+	a := co.AddJob("A", func(ctx context.Context, input interface{}) error {
+		convey := input.(*Convey)
+		convey.output = convey.input
+		return nil
+	})
+	b := co.AddJob("B", func(ctx context.Context, input interface{}) error {
+		input.(*Convey).fromB = 2
+		return nil
+	}, a)
+	c := co.AddJob("C", func(ctx context.Context, input interface{}) error {
+		input.(*Convey).fromC = 3
+		return nil
+	}, a)
+	co.AddJob("D", func(ctx context.Context, input interface{}) error {
+		convey := input.(*Convey)
+		convey.output += convey.fromB + convey.fromC
+		return nil
+	}, b, c)
 
-	// 3. add jobs
-	var A = co.AddJob("A", func(ctx context.Context, i interface{}) error {
-		convey := i.(*Convey)
-		// do something
-		convey.output = 1
-		convey.temporary = 2
-		return nil
-	}) // A depends nothing
-	var B = co.AddJob("B", func(ctx context.Context, i interface{}) error {
-		convey := i.(*Convey)
-		// do something
-		convey.output = 2
-		return nil
-	}, A) // B depends on A
-	var C = co.AddJob("C", func(ctx context.Context, i interface{}) error {
-		convey := i.(*Convey)
-		// do something
-		convey.output = 3
-		return nil
-	}, A) // C depends on A
-	var _ = co.AddJob("D", func(ctx context.Context, i interface{}) error {
-		convey := i.(*Convey)
-		// do something
-		convey.output = 4
-		return nil
-	}, B, C) // D depends on B and C
-
-	// 4. run jobs
-	convey := &Convey{
-		input: 1,
-	}
-	err := co.Do(context.Background(), convey)
-	if err != nil {
-		klog.Errorf("collabor error: %v", err)
-	}
+	_ = co.Do(context.Background(), &Convey{input: 1})
 }
